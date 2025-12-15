@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aks-demo-api
+  namespace: aks-demo
+  labels:
+    app: aks-demo-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aks-demo-api
+  template:
+    metadata:
+      labels:
+        app: aks-demo-api
+    spec:
+      containers:
+      - name: api
+        image: demoacrsword0101.azurecr.io/aks-demo-api:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: ASPNETCORE_ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: ASPNETCORE_ENVIRONMENT
+        - name: ApplicationInsights__ConnectionString
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: appinsights-connection-string
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3

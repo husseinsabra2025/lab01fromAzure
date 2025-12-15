@@ -1,0 +1,215 @@
+trigger:
+  branches:
+    include:
+    - main
+    - master
+  paths:
+    include:
+    - aks-devops-project/aks-devops-project/src/*
+    - k8s/*
+
+variables:
+  # UPDATE THESE VALUES
+  azureSubscription: 'YOUR_SERVICE_CONNECTION_NAME' # Azure service connection name - Update after creating in Azure DevOps
+  resourceGroup: 'sword-devops-01-rg'               # Your Azure resource group
+  acrName: 'demoacrsword0101'                       # Your ACR name (lowercase, no special chars)
+  aksClusterName: 'aksdemoswordcluster'             # Your AKS cluster name
+  appInsightsConnectionString: 'InstrumentationKey=24770f9a-d604-46ce-94fb-febfcf999d35;IngestionEndpoint=https://eastus-8.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus.livediagnostics.monitor.azure.com/;ApplicationId=71fcaf8e-9b0b-4a77-9019-66c039d26b40'
+  
+  # DO NOT CHANGE THESE
+  dockerImageName: 'aks-demo-api'
+  k8sNamespace: 'aks-demo'
+  dockerfilePath: '$(Build.SourcesDirectory)/aks-devops-project/aks-devops-project/src/Dockerfile'
+  dockerBuildContext: '$(Build.SourcesDirectory)/aks-devops-project/aks-devops-project/src'
+
+stages:
+- stage: Build
+  displayName: 'Build and Push Docker Image'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build Docker Image and Push to ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Get ACR Login Server'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          ACR_LOGIN_SERVER=$(az acr show --name $(acrName) --resource-group $(resourceGroup) --query loginServer -o tsv)
+          echo "##vso[task.setvariable variable=ACR_LOGIN_SERVER]$ACR_LOGIN_SERVER"
+          echo "ACR Login Server: $ACR_LOGIN_SERVER"
+
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: 'build'
+        repository: '$(dockerImageName)'
+        dockerfile: '$(dockerfilePath)'
+        buildContext: '$(dockerBuildContext)'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+    - task: AzureCLI@2
+      displayName: 'Login to ACR and Push Image'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Logging into ACR: $(acrName)"
+          az acr login --name $(acrName)
+          
+          echo "Tagging image for ACR"
+          docker tag $(dockerImageName):$(Build.BuildId) $(ACR_LOGIN_SERVER)/$(dockerImageName):$(Build.BuildId)
+          docker tag $(dockerImageName):latest $(ACR_LOGIN_SERVER)/$(dockerImageName):latest
+          
+          echo "Pushing image to ACR"
+          docker push $(ACR_LOGIN_SERVER)/$(dockerImageName):$(Build.BuildId)
+          docker push $(ACR_LOGIN_SERVER)/$(dockerImageName):latest
+          
+          echo "✓ Image pushed successfully to $(ACR_LOGIN_SERVER)/$(dockerImageName):$(Build.BuildId)"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish K8s Manifests as Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/aks-devops-project/k8s'
+        ArtifactName: 'k8s-manifests'
+        publishLocation: 'Container'
+
+- stage: Deploy
+  displayName: 'Deploy to AKS'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToAKS
+    displayName: 'Deploy Application to AKS'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'aks-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download K8s Manifests'
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'k8s-manifests'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: AzureCLI@2
+            displayName: 'Get ACR and AKS Information'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                ACR_LOGIN_SERVER=$(az acr show --name $(acrName) --resource-group $(resourceGroup) --query loginServer -o tsv)
+                echo "##vso[task.setvariable variable=ACR_LOGIN_SERVER]$ACR_LOGIN_SERVER"
+                echo "ACR Login Server: $ACR_LOGIN_SERVER"
+                
+                # Get AKS credentials
+                echo "Getting AKS credentials..."
+                az aks get-credentials --resource-group $(resourceGroup) --name $(aksClusterName) --overwrite-existing
+                
+                echo "✓ kubectl configured for AKS cluster"
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Create Namespace'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'apply'
+              arguments: '-f $(System.ArtifactsDirectory)/k8s-manifests/namespace.yaml'
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Apply ConfigMap'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'apply'
+              arguments: '-f $(System.ArtifactsDirectory)/k8s-manifests/configmap.yaml'
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Create/Update Secret'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'apply'
+              arguments: '-f $(System.ArtifactsDirectory)/k8s-manifests/secret.yaml'
+
+          - task: Bash@3
+            displayName: 'Update Deployment Manifest with Image Tag'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Updating deployment.yaml with actual values..."
+                sed -i "s|YOUR_ACR_NAME.azurecr.io|$(ACR_LOGIN_SERVER)|g" $(System.ArtifactsDirectory)/k8s-manifests/deployment.yaml
+                sed -i "s|:latest|:$(Build.BuildId)|g" $(System.ArtifactsDirectory)/k8s-manifests/deployment.yaml
+                
+                echo "Updated deployment.yaml:"
+                cat $(System.ArtifactsDirectory)/k8s-manifests/deployment.yaml | grep "image:"
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Deploy Application'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'apply'
+              arguments: '-f $(System.ArtifactsDirectory)/k8s-manifests/deployment.yaml'
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Create/Update Service'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'apply'
+              arguments: '-f $(System.ArtifactsDirectory)/k8s-manifests/service.yaml'
+
+          - task: Kubernetes@1
+            displayName: 'kubectl - Get Deployment Status'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: '$(azureSubscription)'
+              azureResourceGroup: '$(resourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              command: 'get'
+              arguments: 'deployments,pods,svc -n $(k8sNamespace)'
+
+          - task: Bash@3
+            displayName: 'Wait for LoadBalancer IP'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Waiting for external IP address..."
+                for i in {1..30}; do
+                  EXTERNAL_IP=$(kubectl get svc aks-demo-api-service -n $(k8sNamespace) -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+                  if [ ! -z "$EXTERNAL_IP" ]; then
+                    echo "✓ External IP assigned: $EXTERNAL_IP"
+                    echo "##vso[task.setvariable variable=EXTERNAL_IP]$EXTERNAL_IP"
+                    echo ""
+                    echo "🎉 Application is accessible at:"
+                    echo "   http://$EXTERNAL_IP"
+                    echo "   http://$EXTERNAL_IP/api/health"
+                    echo "   http://$EXTERNAL_IP/api/products"
+                    exit 0
+                  fi
+                  echo "Waiting for IP... (attempt $i/30)"
+                  sleep 10
+                done
+                echo "⚠️  Timeout waiting for external IP. Check Azure Portal or run: kubectl get svc -n $(k8sNamespace)"
