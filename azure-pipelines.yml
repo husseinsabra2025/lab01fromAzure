@@ -10,7 +10,7 @@ trigger:
 
 variables:
   # UPDATE THESE VALUES
-  azureSubscription: 'YOUR_SERVICE_CONNECTION_NAME' # Azure service connection name - Update after creating in Azure DevOps
+  azureSubscription: 'azure-aks-sword-connection'   # Azure service connection name
   resourceGroup: 'sword-devops-01-rg'               # Your Azure resource group
   acrName: 'demoacrsword0101'                       # Your ACR name (lowercase, no special chars)
   aksClusterName: 'aksdemoswordcluster'             # Your AKS cluster name
