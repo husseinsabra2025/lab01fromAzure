@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: api
-        image: demoacrsword0101.azurecr.io/aks-demo-api:latest
+        image: nginx:latest
         ports:
         - containerPort: 80
         env:
